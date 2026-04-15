@@ -100,49 +100,73 @@ async function generateWithGemini(systemPrompt, userQuestion) {
     `https://generativelanguage.googleapis.com/v1beta/models/` +
     `${GEMINI_MODEL}:generateContent?key=${apiKey}`;
 
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      system_instruction: {
-        parts: [{ text: systemPrompt }],
+  const body = JSON.stringify({
+    system_instruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text: userQuestion }],
       },
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: userQuestion }],
-        },
-      ],
-      generationConfig: {
-        maxOutputTokens: 2048,
-        temperature: 0.3,
-        thinkingConfig: {
-          thinkingBudget: 0,
-        },
+    ],
+    generationConfig: {
+      maxOutputTokens: 2048,
+      temperature: 0.3,
+      thinkingConfig: {
+        thinkingBudget: 0,
       },
-    }),
+    },
   });
 
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`Gemini API ${resp.status}: ${body}`);
+  // Retry on transient errors (503 UNAVAILABLE is common for 2.5
+  // Flash during demand spikes). Short backoffs because Kakao has
+  // a 5s sync timeout — for longer outages, use callback mode.
+  const maxAttempts = 3;
+  let lastErr = '';
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+
+    if ([429, 500, 502, 503, 504].includes(resp.status)) {
+      const errText = await resp.text();
+      lastErr = `Gemini ${resp.status}: ${errText.slice(0, 200)}`;
+      if (attempt < maxAttempts) {
+        const waitMs = 800 * attempt; // 800ms, 1600ms
+        console.warn(
+          `[rag] ${lastErr.slice(0, 120)} — attempt ${attempt}/${maxAttempts}, waiting ${waitMs}ms`,
+        );
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw new Error(`Gemini failed after ${maxAttempts} attempts: ${lastErr}`);
+    }
+
+    if (!resp.ok) {
+      throw new Error(`Gemini API ${resp.status}: ${await resp.text()}`);
+    }
+
+    const data = await resp.json();
+    const candidate = data?.candidates?.[0];
+    const text = candidate?.content?.parts?.[0]?.text;
+
+    if (!text) {
+      const finishReason = candidate?.finishReason ?? 'unknown';
+      const promptFeedback = data?.promptFeedback
+        ? JSON.stringify(data.promptFeedback)
+        : 'none';
+      throw new Error(
+        `Gemini returned no text (finishReason=${finishReason}, ` +
+          `promptFeedback=${promptFeedback})`,
+      );
+    }
+    return text;
   }
 
-  const data = await resp.json();
-  const candidate = data?.candidates?.[0];
-  const text = candidate?.content?.parts?.[0]?.text;
-
-  if (!text) {
-    const finishReason = candidate?.finishReason ?? 'unknown';
-    const promptFeedback = data?.promptFeedback
-      ? JSON.stringify(data.promptFeedback)
-      : 'none';
-    throw new Error(
-      `Gemini returned no text (finishReason=${finishReason}, ` +
-        `promptFeedback=${promptFeedback})`,
-    );
-  }
-  return text;
+  throw new Error(`generateWithGemini: exhausted retries. Last error: ${lastErr}`);
 }
 
 // ---------- Main entry ----------
