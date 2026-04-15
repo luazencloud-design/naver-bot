@@ -32,9 +32,10 @@ app.post('/kakao/skill', async (req, res) => {
     res.json(simpleText(answer));
   } catch (err) {
     console.error('[sync] error:', err);
-    // DEBUG: surface the actual error for diagnosis. Revert after fix.
     res.json(
-      simpleText(`[DEBUG] ${err?.message || String(err)}`.slice(0, 900)),
+      simpleText(
+        '죄송합니다. 일시적으로 답변을 생성하지 못했습니다. 잠시 후 다시 질문해 주세요.',
+      ),
     );
   }
 });
