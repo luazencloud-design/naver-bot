@@ -83,6 +83,13 @@ function searchTopK(queryEmbed, k = TOP_K) {
 }
 
 // ---------- Generate answer (Gemini) ----------
+// Important: Gemini 2.5 models use internal "thinking tokens" by
+// default, which count against maxOutputTokens. With a small budget
+// like 800, thinking can consume the entire allowance and leave no
+// tokens for the actual answer — the response then has no text and
+// finishReason: "MAX_TOKENS". For RAG Q&A we don't need thinking,
+// so we disable it via thinkingConfig.thinkingBudget: 0 and give
+// the visible answer plenty of room.
 async function generateWithGemini(systemPrompt, userQuestion) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -107,8 +114,11 @@ async function generateWithGemini(systemPrompt, userQuestion) {
         },
       ],
       generationConfig: {
-        maxOutputTokens: 800,
+        maxOutputTokens: 2048,
         temperature: 0.3,
+        thinkingConfig: {
+          thinkingBudget: 0,
+        },
       },
     }),
   });
@@ -119,10 +129,17 @@ async function generateWithGemini(systemPrompt, userQuestion) {
   }
 
   const data = await resp.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const candidate = data?.candidates?.[0];
+  const text = candidate?.content?.parts?.[0]?.text;
+
   if (!text) {
+    const finishReason = candidate?.finishReason ?? 'unknown';
+    const promptFeedback = data?.promptFeedback
+      ? JSON.stringify(data.promptFeedback)
+      : 'none';
     throw new Error(
-      `Gemini returned no text. Full response: ${JSON.stringify(data)}`,
+      `Gemini returned no text (finishReason=${finishReason}, ` +
+        `promptFeedback=${promptFeedback})`,
     );
   }
   return text;
