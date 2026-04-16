@@ -1,20 +1,19 @@
 // scripts/ingest.js
 //
 // Multi-file ingestion: walks source-files/, loads text for each
-// .pdf and .pptx (preferring the OCR cache in data/extracted/),
-// chunks each file, embeds every chunk with Gemini, and writes a
-// unified data/chunks.json with source metadata so answers can
-// cite which document they came from.
+// supported file, chunks each, embeds every chunk with Gemini, and
+// writes a unified data/chunks.json with source metadata so answers
+// can cite which document they came from.
+//
+// Supported formats:
+//   .pdf   -> OCR cache or pdf-parse direct extraction
+//   .pptx  -> OCR cache or officeparser direct extraction
+//   .txt   -> direct fs.readFileSync (no extraction library needed)
+//   .mp3   -> OCR cache required (run "npm run ocr" first)
+//   .mp4   -> OCR cache required (run "npm run ocr" first)
 //
 // Single-file override: if SOURCE_FILE is set in .env, only that
-// file is processed (legacy behavior).
-//
-// Text-loading strategy per file:
-//   1. If data/extracted/<basename>.txt exists -> use it (OCR cache)
-//   2. Else try direct text extraction:
-//        .pdf  -> pdf-parse
-//        .pptx -> officeparser
-//   3. If text length < 50 chars -> error, ask user to run "npm run ocr"
+// file is processed.
 //
 // Usage:
 //   npm run ingest
@@ -39,7 +38,7 @@ const SOURCE_DIR = path.join(ROOT, 'source-files');
 const EXTRACTED_DIR = path.join(ROOT, 'data', 'extracted');
 const CHUNKS_PATH = path.join(ROOT, 'data', 'chunks.json');
 
-const SUPPORTED_EXTS = new Set(['.pdf', '.pptx']);
+const SUPPORTED_EXTS = new Set(['.pdf', '.pptx', '.txt', '.mp3', '.mp4']);
 
 function die(msg) {
   console.error(`[ingest] ERROR: ${msg}`);
@@ -80,12 +79,25 @@ async function loadTextForFile(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   let text = '';
 
-  if (ext === '.pdf') {
+  if (ext === '.txt') {
+    // Plain text: just read the file directly.
+    text = fs.readFileSync(filePath, 'utf-8');
+    return { text, source: 'direct' };
+  } else if (ext === '.mp3' || ext === '.mp4') {
+    // Audio/video: no direct text extraction possible.
+    // Must have been transcribed by "npm run ocr" first.
+    throw new Error(
+      `${ext} files require transcription. Run "npm run ocr" first to ` +
+        `populate data/extracted/${stem}.txt, then re-run ingest.`,
+    );
+  } else if (ext === '.pdf') {
     const buf = fs.readFileSync(filePath);
     const pdf = await pdfParse(buf);
     text = pdf.text;
   } else if (ext === '.pptx') {
-    text = await parseOffice(filePath);
+    // officeparser can return Buffer or non-string on some files.
+    const raw = await parseOffice(filePath);
+    text = typeof raw === 'string' ? raw : String(raw || '');
   } else {
     throw new Error(`Unsupported extension: ${ext}`);
   }
@@ -195,8 +207,8 @@ async function main() {
   const sourceFiles = discoverSourceFiles();
   if (sourceFiles.length === 0) {
     die(
-      'No source files found. Add .pdf or .pptx files to source-files/ ' +
-        'or set SOURCE_FILE in .env.',
+      'No source files found. Add .pdf, .pptx, .txt, .mp3, or .mp4 files ' +
+        'to source-files/ or set SOURCE_FILE in .env.',
     );
   }
 

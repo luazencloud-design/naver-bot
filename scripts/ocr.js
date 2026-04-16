@@ -1,24 +1,22 @@
 // scripts/ocr.js
 //
-// Multi-file OCR job: walks source-files/, finds every .pdf and
-// .pptx, uploads each to Gemini's Files API, and writes the
-// extracted text to data/extracted/<basename>.txt as a cache.
+// Multi-file extraction job. Walks source-files/ and processes each
+// supported file into data/extracted/<basename>.txt:
+//
+//   .pdf / .pptx  -> Gemini Files API multimodal OCR (page text)
+//   .mp3          -> Gemini Files API audio transcription
+//   .mp4          -> Gemini Files API video transcription + on-screen text
+//   .txt          -> direct copy (no API call needed)
 //
 // Caching: if data/extracted/<basename>.txt already exists, the
-// file is skipped. Pass --force to re-OCR everything.
+// file is skipped. Pass --force to re-process everything.
 //
 // Single-file override: if SOURCE_FILE is set in .env, only that
-// file is processed (legacy behavior).
-//
-// Why this exists: scripts/ingest.js does direct text extraction
-// (pdf-parse / officeparser), which fails on scanned PDFs and
-// image-only PPTX slides because there's no embedded text layer.
-// Gemini's multimodal capability "reads" the page images and gives
-// us usable text.
+// file is processed.
 //
 // Usage:
 //   npm run ocr            # process new files only (uses cache)
-//   npm run ocr -- --force # re-OCR everything
+//   npm run ocr -- --force # re-process everything
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -39,10 +37,14 @@ const EXTRACTED_DIR = path.join(ROOT, 'data', 'extracted');
 const force = process.argv.includes('--force');
 
 // Map file extension -> Gemini-acceptable MIME type.
+// null = handled locally (no Gemini upload needed).
 const MIME_BY_EXT = {
   '.pdf': 'application/pdf',
   '.pptx':
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.txt': null,           // direct copy — no API call
+  '.mp3': 'audio/mpeg',
+  '.mp4': 'video/mp4',
 };
 
 function die(msg) {
@@ -71,7 +73,7 @@ function discoverSourceFiles() {
   }
   const entries = fs.readdirSync(SOURCE_DIR);
   const supported = entries
-    .filter((name) => MIME_BY_EXT[path.extname(name).toLowerCase()])
+    .filter((name) => path.extname(name).toLowerCase() in MIME_BY_EXT)
     .sort()
     .map((name) => path.join(SOURCE_DIR, name));
   return supported;
@@ -130,9 +132,10 @@ async function uploadFile(filePath, mimeType) {
   return (await uploadResp.json()).file;
 }
 
-async function waitForActive(fileName) {
+// maxIterations: 60 = ~2 min for documents, 150 = ~5 min for audio/video
+async function waitForActive(fileName, maxIterations = 60) {
   const url = `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${GEMINI_API_KEY}`;
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < maxIterations; i++) {
     const resp = await fetch(url);
     if (!resp.ok) {
       throw new Error(`Poll failed ${resp.status}: ${await resp.text()}`);
@@ -142,15 +145,36 @@ async function waitForActive(fileName) {
     if (data.state === 'FAILED') throw new Error('File processing FAILED on Gemini side');
     await new Promise((r) => setTimeout(r, 2000));
   }
-  throw new Error('File did not become ACTIVE within 2 minutes');
+  const mins = Math.round((maxIterations * 2) / 60);
+  throw new Error(`File did not become ACTIVE within ${mins} minutes`);
 }
 
-async function extractText(fileUri, mimeType) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+// ---------- Format-aware extraction prompts ----------
+function buildPrompt(mimeType) {
+  if (mimeType.startsWith('audio/')) {
+    return `이 음성 파일의 내용을 한국어로 정확히 전사(transcribe)해 주세요.
 
-  const prompt = `이 문서의 모든 페이지 또는 슬라이드에 있는 텍스트를 순서대로 정확히 추출해 주세요.
+규칙:
+1. 음성에서 들리는 모든 말을 누락 없이 전사하세요.
+2. 화자가 여러 명이면 "[화자 1]", "[화자 2]" 등으로 구분하세요.
+3. 주요 주제가 바뀌는 지점에서 빈 줄을 넣어 단락을 구분하세요.
+4. 전사 외에 다른 설명, 주석, 요약을 추가하지 마세요.
+5. 들리지 않거나 불명확한 부분은 [불명확]으로 표시하세요.`;
+  }
+
+  if (mimeType.startsWith('video/')) {
+    return `이 영상의 음성을 한국어로 전사하고, 화면에 표시되는 모든 텍스트도 함께 추출해 주세요.
+
+규칙:
+1. 음성 전사: 영상에서 들리는 모든 말을 누락 없이 전사하세요. 화자가 여러 명이면 "[화자 1]", "[화자 2]" 등으로 구분하세요.
+2. 화면 텍스트: 슬라이드, 자막, 칠판, 화면 캡처 등에 표시되는 텍스트를 모두 추출하세요. 각 슬라이드/화면 전환 시 "=== 화면 N ===" 헤더를 넣으세요.
+3. 음성 전사와 화면 텍스트를 시간 순서대로 통합하여 작성하세요.
+4. 전사/추출 외에 다른 설명, 주석, 요약을 추가하지 마세요.
+5. 들리지 않거나 읽을 수 없는 부분은 [불명확] 또는 [판독 불가]로 표시하세요.`;
+  }
+
+  // Default: document (pdf, pptx)
+  return `이 문서의 모든 페이지 또는 슬라이드에 있는 텍스트를 순서대로 정확히 추출해 주세요.
 
 규칙:
 1. 각 페이지/슬라이드의 모든 텍스트(제목, 본문, 표, 목록, 이미지 속 한국어 텍스트 포함)를 누락 없이 추출하세요.
@@ -158,6 +182,14 @@ async function extractText(fileUri, mimeType) {
 3. 각 페이지/슬라이드 시작 부분에 "=== 페이지 N ===" 헤더를 넣으세요.
 4. 추출된 텍스트 외에는 다른 설명, 주석, 메타 정보를 추가하지 마세요.
 5. 손상되거나 읽을 수 없는 부분은 [판독 불가]로 표시하세요.`;
+}
+
+async function extractText(fileUri, mimeType) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/` +
+    `${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const prompt = buildPrompt(mimeType);
 
   const body = JSON.stringify({
     contents: [
@@ -238,15 +270,33 @@ async function ocrFile(filePath) {
 
   const ext = path.extname(filePath).toLowerCase();
   const mimeType = MIME_BY_EXT[ext];
+
+  // .txt files: just copy the source text directly — no API needed.
+  if (mimeType === null && ext === '.txt') {
+    try {
+      const text = fs.readFileSync(filePath, 'utf-8');
+      fs.writeFileSync(cachePath, text, 'utf-8');
+      console.log(`[ocr]   Copied ${text.length} chars (txt direct read)`);
+      return { status: 'processed' };
+    } catch (err) {
+      console.error(`[ocr]   FAILED for ${basename}: ${err.message}`);
+      return { status: 'failed', err };
+    }
+  }
+
   if (!mimeType) {
     console.warn(`[ocr]   Unsupported extension ${ext}, skipping`);
     return { status: 'unsupported' };
   }
 
+  // Audio/video files get a longer processing timeout (5 min vs 2 min).
+  const isMedia = mimeType.startsWith('audio/') || mimeType.startsWith('video/');
+  const pollIterations = isMedia ? 150 : 60;
+
   try {
     const file = await uploadFile(filePath, mimeType);
-    await waitForActive(file.name);
-    console.log('[ocr]   Extracting text...');
+    await waitForActive(file.name, pollIterations);
+    console.log(`[ocr]   Extracting text${isMedia ? ' (media — may take longer)' : ''}...`);
     const { text, truncated } = await extractText(file.uri, file.mimeType);
 
     if (truncated) {
@@ -271,8 +321,8 @@ async function main() {
 
   if (sourceFiles.length === 0) {
     die(
-      'No source files found. Add .pdf or .pptx files to source-files/ ' +
-        'or set SOURCE_FILE in .env.',
+      'No source files found. Add .pdf, .pptx, .txt, .mp3, or .mp4 files ' +
+        'to source-files/ or set SOURCE_FILE in .env.',
     );
   }
 
