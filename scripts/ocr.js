@@ -41,14 +41,25 @@ const force = process.argv.includes('--force');
 
 // Map file extension -> Gemini-acceptable MIME type.
 // null = handled locally (no Gemini upload needed).
+// Note: Gemini Files API does NOT accept PPTX MIME types even though
+// it silently lets you upload them. The generateContent call returns
+// 400 "Unsupported MIME type". So PPTX is intentionally NOT in this
+// map — ingest.js handles text-based PPTX via officeparser, and
+// image-based PPTX must be converted to PDF by the user first.
 const MIME_BY_EXT = {
   '.pdf': 'application/pdf',
-  '.pptx':
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.txt': null,           // direct copy — no API call
   '.hwp': null,           // hwp.js local extraction — no API call
   '.mp3': 'audio/mpeg',
   '.mp4': 'video/mp4',
+};
+
+// Extensions that are intentionally rejected at the OCR step with a
+// helpful message. The user needs to convert these to PDF manually.
+const OCR_UNSUPPORTED_WITH_HINT = {
+  '.pptx':
+    'Gemini Files API does not accept PPTX. Please convert to PDF ' +
+    '(PowerPoint: File > Save As > PDF) and place the PDF in source-files/.',
 };
 
 function die(msg) {
@@ -77,7 +88,12 @@ function discoverSourceFiles() {
   }
   const entries = fs.readdirSync(SOURCE_DIR);
   const supported = entries
-    .filter((name) => path.extname(name).toLowerCase() in MIME_BY_EXT)
+    .filter((name) => {
+      // Skip Office lock files like ~$document.pptx
+      if (name.startsWith('~$')) return false;
+      const ext = path.extname(name).toLowerCase();
+      return ext in MIME_BY_EXT || ext in OCR_UNSUPPORTED_WITH_HINT;
+    })
     .sort()
     .map((name) => path.join(SOURCE_DIR, name));
   return supported;
@@ -273,6 +289,14 @@ async function ocrFile(filePath) {
   console.log(`[ocr] Processing: ${basename}`);
 
   const ext = path.extname(filePath).toLowerCase();
+
+  // Handle extensions that Gemini doesn't accept — print a clear
+  // conversion hint and move on.
+  if (ext in OCR_UNSUPPORTED_WITH_HINT) {
+    console.error(`[ocr]   SKIP: ${OCR_UNSUPPORTED_WITH_HINT[ext]}`);
+    return { status: 'failed', err: new Error('unsupported-by-gemini') };
+  }
+
   const mimeType = MIME_BY_EXT[ext];
 
   // .txt files: just copy the source text directly — no API needed.
