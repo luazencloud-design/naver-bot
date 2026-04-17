@@ -27,6 +27,7 @@ import 'dotenv/config';
 
 import { extractHwpText } from './lib/hwp-extract.js';
 import { extractVttText } from './lib/vtt-extract.js';
+import { convertPptxToPdf } from './lib/pptx-to-pdf.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,11 +44,11 @@ const force = process.argv.includes('--force');
 
 // Map file extension -> Gemini-acceptable MIME type.
 // null = handled locally (no Gemini upload needed).
-// Note: Gemini Files API does NOT accept PPTX MIME types even though
-// it silently lets you upload them. The generateContent call returns
-// 400 "Unsupported MIME type". So PPTX is intentionally NOT in this
-// map — ingest.js handles text-based PPTX via officeparser, and
-// image-based PPTX must be converted to PDF by the user first.
+// Note: Gemini Files API does NOT accept PPTX directly (400
+// "Unsupported MIME type"). We auto-convert PPTX -> PDF before the
+// main loop via PowerPoint COM (see preConvertPptxFiles below), so
+// by the time OCR sees a file it's always already a format Gemini
+// or a local parser can handle.
 const MIME_BY_EXT = {
   '.pdf': 'application/pdf',
   '.txt': null,           // direct copy — no API call
@@ -55,14 +56,6 @@ const MIME_BY_EXT = {
   '.vtt': null,           // WebVTT speech-only extraction — no API call
   '.mp3': 'audio/mpeg',
   '.mp4': 'video/mp4',
-};
-
-// Extensions that are intentionally rejected at the OCR step with a
-// helpful message. The user needs to convert these to PDF manually.
-const OCR_UNSUPPORTED_WITH_HINT = {
-  '.pptx':
-    'Gemini Files API does not accept PPTX. Please convert to PDF ' +
-    '(PowerPoint: File > Save As > PDF) and place the PDF in source-files/.',
 };
 
 function die(msg) {
@@ -90,12 +83,28 @@ function discoverSourceFiles() {
     die(`source-files/ directory not found at ${SOURCE_DIR}`);
   }
   const entries = fs.readdirSync(SOURCE_DIR);
+
+  // Stems that have a .pdf — if a .pptx shares a stem with an
+  // existing .pdf, we skip the .pptx because the PDF (typically the
+  // output of preConvertPptxFiles) will already carry that content.
+  const pdfStems = new Set();
+  for (const name of entries) {
+    if (path.extname(name).toLowerCase() === '.pdf') {
+      pdfStems.add(path.basename(name, path.extname(name)));
+    }
+  }
+
   const supported = entries
     .filter((name) => {
       // Skip Office lock files like ~$document.pptx
       if (name.startsWith('~$')) return false;
       const ext = path.extname(name).toLowerCase();
-      return ext in MIME_BY_EXT || ext in OCR_UNSUPPORTED_WITH_HINT;
+      if (ext === '.pptx') {
+        const stem = path.basename(name, ext);
+        if (pdfStems.has(stem)) return false; // PDF version takes precedence
+        return true; // will be handled by preConvertPptxFiles before OCR
+      }
+      return ext in MIME_BY_EXT;
     })
     .sort()
     .map((name) => path.join(SOURCE_DIR, name));
@@ -292,14 +301,6 @@ async function ocrFile(filePath) {
   console.log(`[ocr] Processing: ${basename}`);
 
   const ext = path.extname(filePath).toLowerCase();
-
-  // Handle extensions that Gemini doesn't accept — print a clear
-  // conversion hint and move on.
-  if (ext in OCR_UNSUPPORTED_WITH_HINT) {
-    console.error(`[ocr]   SKIP: ${OCR_UNSUPPORTED_WITH_HINT[ext]}`);
-    return { status: 'failed', err: new Error('unsupported-by-gemini') };
-  }
-
   const mimeType = MIME_BY_EXT[ext];
 
   // .txt files: just copy the source text directly — no API needed.
@@ -384,8 +385,52 @@ async function ocrFile(filePath) {
   }
 }
 
+// ---------- Pre-conversion: PPTX -> PDF via PowerPoint COM ----------
+// Gemini rejects PPTX directly, and officeparser gives empty text
+// for image-based slides. Running the user's PowerPoint via COM to
+// save-as-PDF gives us a format both Gemini and pdf-parse handle.
+// Skips conversions where the output PDF already exists.
+async function preConvertPptxFiles() {
+  // Skip if user is using single-file override mode on a non-pptx.
+  if (SOURCE_FILE_OVERRIDE && path.extname(SOURCE_FILE_OVERRIDE).toLowerCase() !== '.pptx') {
+    return;
+  }
+  if (!fs.existsSync(SOURCE_DIR)) return;
+
+  const entries = fs.readdirSync(SOURCE_DIR);
+  const pptxEntries = entries.filter(
+    (n) => !n.startsWith('~$') && path.extname(n).toLowerCase() === '.pptx',
+  );
+
+  if (pptxEntries.length === 0) return;
+
+  console.log(`[ocr] Found ${pptxEntries.length} .pptx file(s) — checking for PDF versions...`);
+  for (const name of pptxEntries) {
+    const stem = path.basename(name, path.extname(name));
+    const pptxPath = path.join(SOURCE_DIR, name);
+    const pdfPath = path.join(SOURCE_DIR, `${stem}.pdf`);
+
+    if (fs.existsSync(pdfPath)) {
+      console.log(`[ocr]   PDF exists, skipping convert: ${stem}.pdf`);
+      continue;
+    }
+
+    console.log(`[ocr]   Converting ${name} -> ${stem}.pdf via PowerPoint...`);
+    try {
+      await convertPptxToPdf(pptxPath, pdfPath);
+      console.log(`[ocr]   Converted: ${stem}.pdf`);
+    } catch (err) {
+      console.error(`[ocr]   Conversion FAILED: ${err.message}`);
+      // Continue with other files — this pptx just won't be ingested.
+    }
+  }
+  console.log('');
+}
+
 // ---------- Main ----------
 async function main() {
+  await preConvertPptxFiles();
+
   const sourceFiles = discoverSourceFiles();
 
   if (sourceFiles.length === 0) {

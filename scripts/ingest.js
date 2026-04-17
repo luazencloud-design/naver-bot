@@ -66,9 +66,30 @@ function discoverSourceFiles() {
   if (!fs.existsSync(SOURCE_DIR)) {
     die(`source-files/ directory not found at ${SOURCE_DIR}`);
   }
-  return fs
-    .readdirSync(SOURCE_DIR)
-    .filter((name) => SUPPORTED_EXTS.has(path.extname(name).toLowerCase()))
+
+  const entries = fs.readdirSync(SOURCE_DIR);
+
+  // If both foo.pptx and foo.pdf exist, the PDF takes precedence
+  // (ocr.js pre-converts PPTX to PDF, so the PDF is the
+  // authoritative copy). Skipping the PPTX avoids double-processing.
+  const pdfStems = new Set();
+  for (const name of entries) {
+    if (path.extname(name).toLowerCase() === '.pdf') {
+      pdfStems.add(path.basename(name, path.extname(name)));
+    }
+  }
+
+  return entries
+    .filter((name) => {
+      if (name.startsWith('~$')) return false;
+      const ext = path.extname(name).toLowerCase();
+      if (!SUPPORTED_EXTS.has(ext)) return false;
+      if (ext === '.pptx') {
+        const stem = path.basename(name, ext);
+        if (pdfStems.has(stem)) return false;
+      }
+      return true;
+    })
     .sort()
     .map((name) => path.join(SOURCE_DIR, name));
 }
