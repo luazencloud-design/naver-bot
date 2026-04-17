@@ -7,6 +7,7 @@
 //   .mp3          -> Gemini Files API audio transcription
 //   .mp4          -> Gemini Files API video transcription + on-screen text
 //   .txt          -> direct copy (no API call needed)
+//   .hwp          -> hwp.js local text extraction (no API call needed)
 //
 // Caching: if data/extracted/<basename>.txt already exists, the
 // file is skipped. Pass --force to re-process everything.
@@ -22,6 +23,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
+
+import { extractHwpText } from './lib/hwp-extract.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,6 +46,7 @@ const MIME_BY_EXT = {
   '.pptx':
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.txt': null,           // direct copy — no API call
+  '.hwp': null,           // hwp.js local extraction — no API call
   '.mp3': 'audio/mpeg',
   '.mp4': 'video/mp4',
 };
@@ -284,6 +288,25 @@ async function ocrFile(filePath) {
     }
   }
 
+  // .hwp files: parse locally via hwp.js — no API needed.
+  if (mimeType === null && ext === '.hwp') {
+    try {
+      const text = extractHwpText(filePath);
+      if (!text || text.trim().length < 50) {
+        throw new Error(
+          `Only ${text.length} chars extracted — HWP may be scanned/image-based ` +
+            `or an older HWP format that hwp.js can't parse.`,
+        );
+      }
+      fs.writeFileSync(cachePath, text, 'utf-8');
+      console.log(`[ocr]   Extracted ${text.length} chars (hwp.js local parse)`);
+      return { status: 'processed' };
+    } catch (err) {
+      console.error(`[ocr]   FAILED for ${basename}: ${err.message}`);
+      return { status: 'failed', err };
+    }
+  }
+
   if (!mimeType) {
     console.warn(`[ocr]   Unsupported extension ${ext}, skipping`);
     return { status: 'unsupported' };
@@ -321,7 +344,7 @@ async function main() {
 
   if (sourceFiles.length === 0) {
     die(
-      'No source files found. Add .pdf, .pptx, .txt, .mp3, or .mp4 files ' +
+      'No source files found. Add .pdf, .pptx, .txt, .hwp, .mp3, or .mp4 files ' +
         'to source-files/ or set SOURCE_FILE in .env.',
     );
   }

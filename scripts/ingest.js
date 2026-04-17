@@ -9,6 +9,7 @@
 //   .pdf   -> OCR cache or pdf-parse direct extraction
 //   .pptx  -> OCR cache or officeparser direct extraction
 //   .txt   -> direct fs.readFileSync (no extraction library needed)
+//   .hwp   -> hwp.js local extraction (no API call needed)
 //   .mp3   -> OCR cache required (run "npm run ocr" first)
 //   .mp4   -> OCR cache required (run "npm run ocr" first)
 //
@@ -26,6 +27,8 @@ import 'dotenv/config';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import { parseOffice } from 'officeparser';
 
+import { extractHwpText } from './lib/hwp-extract.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
@@ -38,7 +41,7 @@ const SOURCE_DIR = path.join(ROOT, 'source-files');
 const EXTRACTED_DIR = path.join(ROOT, 'data', 'extracted');
 const CHUNKS_PATH = path.join(ROOT, 'data', 'chunks.json');
 
-const SUPPORTED_EXTS = new Set(['.pdf', '.pptx', '.txt', '.mp3', '.mp4']);
+const SUPPORTED_EXTS = new Set(['.pdf', '.pptx', '.txt', '.hwp', '.mp3', '.mp4']);
 
 function die(msg) {
   console.error(`[ingest] ERROR: ${msg}`);
@@ -83,6 +86,9 @@ async function loadTextForFile(filePath) {
     // Plain text: just read the file directly.
     text = fs.readFileSync(filePath, 'utf-8');
     return { text, source: 'direct' };
+  } else if (ext === '.hwp') {
+    // HWP 5.x: parse locally via hwp.js (no API call).
+    text = extractHwpText(filePath);
   } else if (ext === '.mp3' || ext === '.mp4') {
     // Audio/video: no direct text extraction possible.
     // Must have been transcribed by "npm run ocr" first.
@@ -207,7 +213,7 @@ async function main() {
   const sourceFiles = discoverSourceFiles();
   if (sourceFiles.length === 0) {
     die(
-      'No source files found. Add .pdf, .pptx, .txt, .mp3, or .mp4 files ' +
+      'No source files found. Add .pdf, .pptx, .txt, .hwp, .mp3, or .mp4 files ' +
         'to source-files/ or set SOURCE_FILE in .env.',
     );
   }
