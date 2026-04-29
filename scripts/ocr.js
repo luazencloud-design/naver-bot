@@ -293,9 +293,18 @@ async function ocrFile(filePath) {
   const cachePath = path.join(EXTRACTED_DIR, `${stem}.txt`);
 
   if (!force && fs.existsSync(cachePath)) {
-    const cachedSize = fs.statSync(cachePath).size;
-    console.log(`[ocr] SKIP cached (${cachedSize}b): ${basename}`);
-    return { status: 'skipped' };
+    // Use the cache only if it's at least as new as the source.
+    // Otherwise the user edited the source after we cached, and we
+    // need to re-process. (This is what bit the user when they
+    // updated 찬수야 보고있냐 이게 나다.txt — the cache had the
+    // old shorter version and we kept serving stale chunks.)
+    const cacheStat = fs.statSync(cachePath);
+    const sourceStat = fs.statSync(filePath);
+    if (cacheStat.mtimeMs >= sourceStat.mtimeMs) {
+      console.log(`[ocr] SKIP cached (${cacheStat.size}b): ${basename}`);
+      return { status: 'skipped' };
+    }
+    console.log(`[ocr] STALE cache (source is newer), re-processing: ${basename}`);
   }
 
   console.log(`[ocr] Processing: ${basename}`);

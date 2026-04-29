@@ -8,26 +8,34 @@ echo.
 
 cd /d "%~dp0"
 
-echo [1/4] Ingesting source files...
+echo [1/5] OCR pass (processes new scanned/image files, skips cached)...
+call npm run ocr
+if errorlevel 1 (
+    echo.
+    echo [WARN] OCR step had failures. Continuing with available caches.
+    echo.
+)
+
+echo.
+echo [2/5] Ingesting source files...
 call npm run ingest
 if errorlevel 1 (
     echo.
     echo [ERROR] Ingest failed. Check the error above.
-    echo         If files are scanned/image-based, run "npm run ocr" first.
     pause
     exit /b 1
 )
 
 echo.
-echo [2/4] Staging chunks.json...
+echo [3/5] Staging chunks.json...
 git add data\chunks.json
 
 echo.
-echo [3/4] Committing...
+echo [4/5] Committing...
 git commit -m "Update knowledge base"
 
 echo.
-echo [4/4] Pushing to GitHub (Vercel auto-deploys)...
+echo [5/5] Pushing to GitHub (Vercel auto-deploys)...
 git push
 
 echo.
